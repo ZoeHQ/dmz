@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+fetch.py — URL → Content materializer
+
+Reads URL files from fetch/queue/, fetches content via Jina Reader,
+writes markdown to fetch/output/ with timestamp-prefixed filenames.
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse, quote
+
+
+QUEUE_DIR = Path("fetch/queue")
+OUTPUT_DIR = Path("fetch/output")
+JINA_READER_PREFIX = "https://r.jina.ai/"
+
+
+def parse_input_file(content: str) -> list[dict]:
+    """
+    Parse input file content into list of {url, note} dicts.
+
+    Handles:
+    - Single URL
+    - URL with note (blank line separated)
+    - Multiple URLs (markdown list)
+    - JSON format
+    """
+    content = content.strip()
+    if not content:
+        return []
+
+    # Try JSON first
+    if content.startswith("{") or content.startswith("["):
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                return [{"url": data.get("url", ""), "note": data.get("note", "")}]
+            elif isinstance(data, list):
+                return [{"url": item.get("url", ""), "note": item.get("note", "")} for item in data]
+        except json.JSONDecodeError:
+            pass  # Fall through to other formats
+
+    # Check for markdown list format (lines starting with "- http")
+    lines = content.split("\n")
+    list_pattern = re.compile(r"^[-*]\s+(https?://\S+)(?:\s+[—–-]\s+(.*))?$")
+
+    list_items = []
+    for line in lines:
+        match = list_pattern.match(line.strip())
+        if match:
+            list_items.append({"url": match.group(1), "note": match.group(2) or ""})
+
+    if list_items:
+        return list_items
+
+    # Single URL or URL with note
+    # First non-empty line should be URL
+    url_pattern = re.compile(r"^https?://\S+$")
+
+    parts = content.split("\n\n", 1)
+    first_part = parts[0].strip()
+
+    # Check if first line is a URL
+    first_line = first_part.split("\n")[0].strip()
+    if url_pattern.match(first_line):
+        note = parts[1].strip() if len(parts) > 1 else ""
+        return [{"url": first_line, "note": note}]
+
+    # Try to find any URL in the content
+    url_match = re.search(r"https?://\S+", content)
+    if url_match:
+        return [{"url": url_match.group(0), "note": ""}]
+
+    return []
+
+
+def fetch_via_jina(url: str) -> dict:
+    """
+    Fetch URL content via Jina Reader.
+
+    Returns dict with success, title, content, error.
+    """
+    jina_url = JINA_READER_PREFIX + url
+
+    try:
+        req = urllib.request.Request(
+            jina_url,
+            headers={
+                "User-Agent": "ZoeHQ-Fetch/1.0",
+                "Accept": "text/plain",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            content = response.read().decode("utf-8")
+
+            # Jina Reader returns markdown with title as first # heading
+            title = ""
+            title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+            if title_match:
+                title = title_match.group(1).strip()
+            else:
+                # Fallback: use domain as title
+                parsed = urlparse(url)
+                title = parsed.netloc
+
+            return {
+                "success": True,
+                "title": title,
+                "content": content,
+                "error": None
+            }
+    except urllib.error.HTTPError as e:
+        return {
+            "success": False,
+            "title": "",
+            "content": "",
+            "error": f"HTTP {e.code}: {e.reason}"
+        }
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "title": "",
+            "content": "",
+            "error": f"URL Error: {e.reason}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "title": "",
+            "content": "",
+            "error": str(e)
+        }
+
+
+def slugify(text: str, max_length: int = 50) -> str:
+    """Convert text to URL-friendly slug."""
+    # Remove non-alphanumeric chars, replace spaces with hyphens
+    slug = re.sub(r"[^\w\s-]", "", text.lower())
+    slug = re.sub(r"[-\s]+", "-", slug).strip("-")
+    return slug[:max_length]
+
+
+def write_output(url: str, title: str, content: str, note: str, timestamp: datetime) -> Path:
+    """
+    Write fetched content to output directory.
+
+    Returns path to created file.
+    """
+    # Create timestamp-prefixed filename
+    ts_str = timestamp.strftime("%Y-%m-%dT%H%M%S")
+    title_slug = slugify(title) if title else slugify(urlparse(url).netloc)
+    filename = f"{ts_str}-{title_slug}.md"
+
+    # Build frontmatter
+    frontmatter = f"""---
+url: {url}
+title: {title}
+fetched_at: {timestamp.isoformat()}
+"""
+    if note:
+        # Escape note for YAML
+        escaped_note = note.replace('"', '\\"')
+        frontmatter += f'source_note: "{escaped_note}"\n'
+    frontmatter += "---\n\n"
+
+    # Combine frontmatter and content
+    full_content = frontmatter + content
+
+    # Write file
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / filename
+    output_path.write_text(full_content, encoding="utf-8")
+
+    return output_path
+
+
+def process_queue():
+    """Process all files in the queue directory."""
+    if not QUEUE_DIR.exists():
+        print(f"Queue directory {QUEUE_DIR} does not exist")
+        return
+
+    # Get all files except .gitkeep
+    queue_files = [f for f in QUEUE_DIR.iterdir() if f.is_file() and f.name != ".gitkeep"]
+
+    if not queue_files:
+        print("No files in queue")
+        return
+
+    print(f"Found {len(queue_files)} file(s) in queue")
+
+    results = {"success": 0, "failed": 0, "files_processed": []}
+
+    for queue_file in queue_files:
+        print(f"\nProcessing: {queue_file.name}")
+
+        try:
+            content = queue_file.read_text(encoding="utf-8")
+            urls = parse_input_file(content)
+
+            if not urls:
+                print(f"  No URLs found in {queue_file.name}")
+                results["failed"] += 1
+                continue
+
+            print(f"  Found {len(urls)} URL(s)")
+
+            for i, item in enumerate(urls):
+                url = item["url"]
+                note = item["note"]
+
+                if not url:
+                    print(f"  Skipping empty URL")
+                    continue
+
+                print(f"  Fetching: {url}")
+
+                # Fetch content
+                fetch_result = fetch_via_jina(url)
+
+                if fetch_result["success"]:
+                    # Use slightly offset timestamps for multiple URLs
+                    timestamp = datetime.now(timezone.utc)
+                    if i > 0:
+                        # Add seconds offset for ordering
+                        from datetime import timedelta
+                        timestamp = timestamp + timedelta(seconds=i)
+
+                    output_path = write_output(
+                        url=url,
+                        title=fetch_result["title"],
+                        content=fetch_result["content"],
+                        note=note,
+                        timestamp=timestamp
+                    )
+                    print(f"  ✓ Written: {output_path.name}")
+                    results["success"] += 1
+                else:
+                    print(f"  ✗ Failed: {fetch_result['error']}")
+                    results["failed"] += 1
+
+            # Delete processed queue file
+            queue_file.unlink()
+            results["files_processed"].append(queue_file.name)
+            print(f"  Deleted: {queue_file.name}")
+
+        except Exception as e:
+            print(f"  Error processing {queue_file.name}: {e}")
+            results["failed"] += 1
+
+    print(f"\n--- Summary ---")
+    print(f"URLs fetched: {results['success']}")
+    print(f"URLs failed: {results['failed']}")
+    print(f"Queue files processed: {len(results['files_processed'])}")
+
+    # Exit with error if any failures
+    if results["failed"] > 0:
+        sys.exit(1)
+
+
+def fetch_single_url(url: str, note: str = ""):
+    """Fetch a single URL (for manual/workflow dispatch)."""
+    print(f"Fetching: {url}")
+
+    fetch_result = fetch_via_jina(url)
+
+    if fetch_result["success"]:
+        timestamp = datetime.now(timezone.utc)
+        output_path = write_output(
+            url=url,
+            title=fetch_result["title"],
+            content=fetch_result["content"],
+            note=note,
+            timestamp=timestamp
+        )
+        print(f"✓ Written: {output_path.name}")
+    else:
+        print(f"✗ Failed: {fetch_result['error']}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # Single URL mode (from workflow dispatch)
+        url = sys.argv[1]
+        note = sys.argv[2] if len(sys.argv) > 2 else ""
+        fetch_single_url(url, note)
+    else:
+        # Queue processing mode
+        process_queue()

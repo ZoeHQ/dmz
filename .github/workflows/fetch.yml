@@ -1,0 +1,64 @@
+name: Fetch URLs
+
+on:
+  push:
+    paths:
+      - 'fetch/queue/**'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to fetch and materialize'
+        required: true
+        type: string
+      note:
+        description: 'Optional note/context'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Process queue or fetch URL
+        run: |
+          if [ -n "${{ github.event.inputs.url }}" ]; then
+            # Manual dispatch mode
+            python scripts/fetch.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.note }}"
+          else
+            # Queue processing mode
+            python scripts/fetch.py
+          fi
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add output files
+          git add fetch/output/
+
+          # Remove processed queue files (if any were deleted)
+          git add fetch/queue/
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Fetch: materialize URLs
+
+            🤖 Automated by fetch workflow"
+            git push
+          fi
