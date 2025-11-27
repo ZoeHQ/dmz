@@ -19,6 +19,11 @@ https://example.com/article
 
 This is context about why I'm saving this.
 
+# Multiple URLs (markdown list)
+- https://example.com/article1 — notes about article 1
+- https://example.com/article2 — notes about article 2
+- https://example.com/article3
+
 # JSON (for programmatic use)
 {
   "url": "https://example.com/article",
@@ -27,15 +32,17 @@ This is context about why I'm saving this.
 }
 ```
 
-**Filename**: Anything, but prefer descriptive (e.g., `2025-11-27-article-title.txt`).
+**Filename**: Anything works (e.g., `urls-to-fetch.txt`).
 
 ### Output (output/)
 
-Materialized content lands here as markdown:
+Materialized content lands here as markdown.  **Filenames are timestamp-prefixed** for chronological sorting:
 
 ```
 output/
-└── 2025-11-27-article-title.md
+├── 2025-11-27T120000-article-title.md
+├── 2025-11-27T120001-another-article.md
+└── 2025-11-27T120002-third-article.md
 ```
 
 **Format**:
