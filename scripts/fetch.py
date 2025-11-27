@@ -207,16 +207,17 @@ def fetch_via_playwright(url: str) -> dict:
             )
             page = context.new_page()
 
-            # Navigate and wait for content
-            page.goto(url, wait_until="networkidle", timeout=60000)
-
-            # Different extraction strategies based on URL
+            # Different wait strategies based on URL
+            # Claude/ChatGPT have persistent connections, so networkidle never fires
             if "claude.ai/share" in url:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 content, title = extract_claude_share(page)
             elif "chatgpt.com/share" in url or "chat.openai.com/share" in url:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 content, title = extract_chatgpt_share(page)
             else:
-                # Generic extraction
+                # Generic: try networkidle for regular pages
+                page.goto(url, wait_until="networkidle", timeout=60000)
                 title = page.title()
                 content = page.content()
                 # Try to get main content
@@ -254,30 +255,71 @@ def fetch_via_playwright(url: str) -> dict:
 
 def extract_claude_share(page) -> tuple[str, str]:
     """Extract conversation content from Claude share page."""
-    # Wait for conversation to load
-    page.wait_for_selector('[class*="ConversationItem"], [class*="message"]', timeout=30000)
+    import time
+
+    # Give the page time to render JS content
+    time.sleep(3)
+
+    # Try multiple selector strategies for Claude's conversation
+    selectors_to_try = [
+        '[data-testid*="message"]',
+        '[class*="ConversationItem"]',
+        '[class*="message"]',
+        '[class*="Message"]',
+        '[class*="turn"]',
+        '[class*="Turn"]',
+        'div[class*="prose"]',
+    ]
+
+    # Wait for any conversation content to appear
+    for selector in selectors_to_try:
+        try:
+            page.wait_for_selector(selector, timeout=10000)
+            break
+        except:
+            continue
 
     title = page.title()
     if " - Claude" in title:
         title = title.replace(" - Claude", "").strip()
+    if "Claude" == title:
+        title = "Claude Conversation"
 
     # Extract conversation turns
     messages = []
 
-    # Try different selectors for Claude's conversation structure
-    turns = page.query_selector_all('[class*="ConversationItem"], [class*="turn"], [data-testid*="message"]')
+    # Try each selector
+    turns = []
+    for selector in selectors_to_try:
+        turns = page.query_selector_all(selector)
+        if turns:
+            break
 
     if not turns:
         # Fallback: get all text content from main area
         main = page.query_selector("main")
         if main:
-            return main.inner_text(), title
+            text = main.inner_text()
+            # Clean up the text
+            if text and len(text) > 100:
+                return f"# {title}\n\n{text}", title
+
+        # Last resort: get body text
+        body = page.query_selector("body")
+        if body:
+            text = body.inner_text()
+            return f"# {title}\n\n{text}", title
 
     for turn in turns:
-        # Try to identify speaker (human vs assistant)
         text = turn.inner_text().strip()
-        if text:
+        if text and len(text) > 10:  # Skip very short fragments
             messages.append(text)
+
+    if not messages:
+        # Fallback to main content
+        main = page.query_selector("main")
+        if main:
+            return f"# {title}\n\n{main.inner_text()}", title
 
     content = "\n\n---\n\n".join(messages)
 
