@@ -39,6 +39,16 @@ LOGIN_PAGE_INDICATORS = [
     "Create an account",
 ]
 
+# Cloudflare challenge indicators
+CLOUDFLARE_INDICATORS = [
+    "Just a moment...",
+    "Verify you are human",
+    "checking your browser",
+    "Enable JavaScript and cookies",
+    "Ray ID:",
+    "cloudflare",
+]
+
 
 def parse_input_file(content: str) -> list[dict]:
     """
@@ -115,6 +125,14 @@ def is_login_page(content: str) -> bool:
     return False
 
 
+def is_cloudflare_challenge(content: str) -> bool:
+    """Check if content is a Cloudflare challenge page."""
+    content_lower = content.lower()
+    matches = sum(1 for indicator in CLOUDFLARE_INDICATORS if indicator.lower() in content_lower)
+    # Need at least 2 indicators to confirm it's Cloudflare
+    return matches >= 2
+
+
 def fetch_via_jina(url: str) -> dict:
     """
     Fetch URL content via Jina Reader.
@@ -187,6 +205,7 @@ def fetch_via_playwright(url: str) -> dict:
     Fetch URL content via Playwright (headless browser).
 
     Used for JS-heavy sites like Claude/ChatGPT shares.
+    Uses playwright-stealth to help bypass bot detection.
     Returns dict with success, title, content, error.
     """
     try:
@@ -199,13 +218,29 @@ def fetch_via_playwright(url: str) -> dict:
             "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"
         }
 
+    # Try to import stealth plugin
+    try:
+        from playwright_stealth import stealth_sync
+        has_stealth = True
+    except ImportError:
+        has_stealth = False
+        print("    → playwright-stealth not available, using standard browser")
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
             )
             page = context.new_page()
+
+            # Apply stealth mode if available
+            if has_stealth:
+                stealth_sync(page)
+                print("    → Stealth mode applied")
 
             # Different wait strategies based on URL
             # Claude/ChatGPT have persistent connections, so networkidle never fires
@@ -235,6 +270,15 @@ def fetch_via_playwright(url: str) -> dict:
                     "title": "",
                     "content": "",
                     "error": "Failed to extract meaningful content"
+                }
+
+            # Check for Cloudflare challenge page
+            if is_cloudflare_challenge(content) or title == "Just a moment...":
+                return {
+                    "success": False,
+                    "title": "",
+                    "content": "",
+                    "error": "Blocked by Cloudflare challenge (bot detection)"
                 }
 
             return {
