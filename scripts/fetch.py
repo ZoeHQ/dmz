@@ -218,12 +218,14 @@ def fetch_via_playwright(url: str) -> dict:
             "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"
         }
 
-    # Try to import stealth plugin
+    # Try to import stealth plugin (v2.0+ API)
     try:
-        from playwright_stealth import stealth_sync
+        from playwright_stealth import Stealth
+        stealth = Stealth()
         has_stealth = True
     except ImportError:
         has_stealth = False
+        stealth = None
         print("    → playwright-stealth not available, using standard browser")
 
     try:
@@ -235,12 +237,12 @@ def fetch_via_playwright(url: str) -> dict:
                 locale="en-US",
                 timezone_id="America/New_York",
             )
-            page = context.new_page()
-
-            # Apply stealth mode if available
+            # Apply stealth mode to context if available (v2.0+ API)
             if has_stealth:
-                stealth_sync(page)
+                stealth.apply_stealth_sync(context)
                 print("    → Stealth mode applied")
+
+            page = context.new_page()
 
             # Different wait strategies based on URL
             # Claude/ChatGPT have persistent connections, so networkidle never fires

@@ -36,7 +36,7 @@ jobs:
         run: |
           pip install playwright playwright-stealth
           pip list | grep -i stealth || echo "Warning: stealth package not found"
-          python -c "from playwright_stealth import stealth_sync; print('stealth import OK')" || echo "stealth import failed"
+          python -c "from playwright_stealth import Stealth; print('stealth import OK')" || echo "stealth import failed"
           playwright install chromium
           playwright install-deps chromium
 
