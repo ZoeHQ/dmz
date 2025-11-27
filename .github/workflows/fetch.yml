@@ -32,6 +32,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
       - name: Process queue or fetch URL
         run: |
           if [ -n "${{ github.event.inputs.url }}" ]; then

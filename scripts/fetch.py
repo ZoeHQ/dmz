@@ -4,6 +4,8 @@ fetch.py — URL → Content materializer
 
 Reads URL files from fetch/queue/, fetches content via Jina Reader,
 writes markdown to fetch/output/ with timestamp-prefixed filenames.
+
+Falls back to Playwright for JS-heavy sites (Claude/ChatGPT shares).
 """
 
 import json
@@ -20,6 +22,22 @@ from urllib.parse import urlparse, quote
 QUEUE_DIR = Path("fetch/queue")
 OUTPUT_DIR = Path("fetch/output")
 JINA_READER_PREFIX = "https://r.jina.ai/"
+
+# URLs that require JavaScript rendering
+JS_REQUIRED_PATTERNS = [
+    r"claude\.ai/share/",
+    r"chatgpt\.com/share/",
+    r"chat\.openai\.com/share/",
+]
+
+# Content patterns that indicate we got a login page instead of real content
+LOGIN_PAGE_INDICATORS = [
+    "Continue with Google",
+    "Continue with email",
+    "Log in",
+    "Sign up",
+    "Create an account",
+]
 
 
 def parse_input_file(content: str) -> list[dict]:
@@ -81,6 +99,22 @@ def parse_input_file(content: str) -> list[dict]:
     return []
 
 
+def needs_js_rendering(url: str) -> bool:
+    """Check if URL requires JavaScript rendering."""
+    for pattern in JS_REQUIRED_PATTERNS:
+        if re.search(pattern, url):
+            return True
+    return False
+
+
+def is_login_page(content: str) -> bool:
+    """Check if content appears to be a login page instead of real content."""
+    for indicator in LOGIN_PAGE_INDICATORS:
+        if indicator in content:
+            return True
+    return False
+
+
 def fetch_via_jina(url: str) -> dict:
     """
     Fetch URL content via Jina Reader.
@@ -99,6 +133,15 @@ def fetch_via_jina(url: str) -> dict:
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             content = response.read().decode("utf-8")
+
+            # Check if we got a login page instead of real content
+            if is_login_page(content):
+                return {
+                    "success": False,
+                    "title": "",
+                    "content": "",
+                    "error": "Got login page instead of content (JS rendering required)"
+                }
 
             # Jina Reader returns markdown with title as first # heading
             title = ""
@@ -137,6 +180,181 @@ def fetch_via_jina(url: str) -> dict:
             "content": "",
             "error": str(e)
         }
+
+
+def fetch_via_playwright(url: str) -> dict:
+    """
+    Fetch URL content via Playwright (headless browser).
+
+    Used for JS-heavy sites like Claude/ChatGPT shares.
+    Returns dict with success, title, content, error.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {
+            "success": False,
+            "title": "",
+            "content": "",
+            "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"
+        }
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            )
+            page = context.new_page()
+
+            # Navigate and wait for content
+            page.goto(url, wait_until="networkidle", timeout=60000)
+
+            # Different extraction strategies based on URL
+            if "claude.ai/share" in url:
+                content, title = extract_claude_share(page)
+            elif "chatgpt.com/share" in url or "chat.openai.com/share" in url:
+                content, title = extract_chatgpt_share(page)
+            else:
+                # Generic extraction
+                title = page.title()
+                content = page.content()
+                # Try to get main content
+                main = page.query_selector("main, article, .content, #content")
+                if main:
+                    content = main.inner_text()
+                else:
+                    content = page.query_selector("body").inner_text()
+
+            browser.close()
+
+            if not content or len(content.strip()) < 100:
+                return {
+                    "success": False,
+                    "title": "",
+                    "content": "",
+                    "error": "Failed to extract meaningful content"
+                }
+
+            return {
+                "success": True,
+                "title": title,
+                "content": content,
+                "error": None
+            }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "title": "",
+            "content": "",
+            "error": f"Playwright error: {str(e)}"
+        }
+
+
+def extract_claude_share(page) -> tuple[str, str]:
+    """Extract conversation content from Claude share page."""
+    # Wait for conversation to load
+    page.wait_for_selector('[class*="ConversationItem"], [class*="message"]', timeout=30000)
+
+    title = page.title()
+    if " - Claude" in title:
+        title = title.replace(" - Claude", "").strip()
+
+    # Extract conversation turns
+    messages = []
+
+    # Try different selectors for Claude's conversation structure
+    turns = page.query_selector_all('[class*="ConversationItem"], [class*="turn"], [data-testid*="message"]')
+
+    if not turns:
+        # Fallback: get all text content from main area
+        main = page.query_selector("main")
+        if main:
+            return main.inner_text(), title
+
+    for turn in turns:
+        # Try to identify speaker (human vs assistant)
+        text = turn.inner_text().strip()
+        if text:
+            messages.append(text)
+
+    content = "\n\n---\n\n".join(messages)
+
+    # Format as markdown
+    markdown = f"# {title}\n\n{content}"
+
+    return markdown, title
+
+
+def extract_chatgpt_share(page) -> tuple[str, str]:
+    """Extract conversation content from ChatGPT share page."""
+    # Wait for conversation to load
+    page.wait_for_selector('[class*="agent-turn"], [class*="user-turn"], [data-message-author-role]', timeout=30000)
+
+    title = page.title()
+    if " | ChatGPT" in title:
+        title = title.replace(" | ChatGPT", "").strip()
+    if "ChatGPT - " in title:
+        title = title.replace("ChatGPT - ", "").strip()
+
+    # Extract conversation turns
+    messages = []
+
+    # Try different selectors for ChatGPT's conversation structure
+    turns = page.query_selector_all('[data-message-author-role], [class*="agent-turn"], [class*="user-turn"]')
+
+    if not turns:
+        # Fallback: get main content
+        main = page.query_selector("main")
+        if main:
+            return main.inner_text(), title
+
+    for turn in turns:
+        role = turn.get_attribute("data-message-author-role") or ""
+        text = turn.inner_text().strip()
+
+        if text:
+            if role == "user":
+                messages.append(f"**Human:**\n{text}")
+            elif role == "assistant":
+                messages.append(f"**Assistant:**\n{text}")
+            else:
+                messages.append(text)
+
+    content = "\n\n---\n\n".join(messages)
+
+    # Format as markdown
+    markdown = f"# {title}\n\n{content}"
+
+    return markdown, title
+
+
+def fetch_url(url: str) -> dict:
+    """
+    Fetch URL content, using appropriate method.
+
+    1. If URL needs JS rendering, use Playwright directly
+    2. Otherwise, try Jina Reader first
+    3. Fall back to Playwright if Jina returns login page
+    """
+    # Check if URL requires JS rendering
+    if needs_js_rendering(url):
+        print(f"    → JS rendering required, using Playwright")
+        return fetch_via_playwright(url)
+
+    # Try Jina Reader first
+    result = fetch_via_jina(url)
+
+    if result["success"]:
+        return result
+
+    # If Jina failed with login page indicator, try Playwright
+    if "login page" in result.get("error", "").lower() or "JS rendering" in result.get("error", ""):
+        print(f"    → Jina got login page, falling back to Playwright")
+        return fetch_via_playwright(url)
+
+    return result
 
 
 def slugify(text: str, max_length: int = 50) -> str:
@@ -222,8 +440,8 @@ def process_queue():
 
                 print(f"  Fetching: {url}")
 
-                # Fetch content
-                fetch_result = fetch_via_jina(url)
+                # Fetch content (Jina first, Playwright fallback)
+                fetch_result = fetch_url(url)
 
                 if fetch_result["success"]:
                     # Use slightly offset timestamps for multiple URLs
@@ -269,7 +487,7 @@ def fetch_single_url(url: str, note: str = ""):
     """Fetch a single URL (for manual/workflow dispatch)."""
     print(f"Fetching: {url}")
 
-    fetch_result = fetch_via_jina(url)
+    fetch_result = fetch_url(url)
 
     if fetch_result["success"]:
         timestamp = datetime.now(timezone.utc)
